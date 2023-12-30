@@ -22,6 +22,8 @@ class ModelArgs:
     norm_eps: float = 1e-5
     max_seq_len: int = 2048
     dropout: float = 0.0
+    pad_idx: int = -1
+    train_half_sized_model_alongside: bool = False
 
 
 class RMSNorm(torch.nn.Module):
@@ -237,6 +239,8 @@ class Transformer(nn.Module):
 
         # Initialize attribute for the loss of the last forward call. This will be set if the forward is called with a targets tensor.
         self.last_loss = None
+        self.last_full_loss = None
+        self.last_half_loss = None
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -253,14 +257,29 @@ class Transformer(nn.Module):
         freqs_cos = self.freqs_cos[:seqlen]
         freqs_sin = self.freqs_sin[:seqlen]
 
-        for layer in self.layers:
+        extra_final_h = None
+
+        for i, layer in enumerate(self.layers):
             h = layer(h, freqs_cos, freqs_sin)
+            if (i + 1) == (len(self.layers) // 2) and self.params.train_half_sized_model_alongside:
+                extra_final_h = h
+
         h = self.norm(h)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
+            def loss(logits):
+                return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=self.params.pad_idx)
             logits = self.output(h)
-            self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            self.last_loss = loss(logits)
+
+            if extra_final_h is not None:
+                extra_final_h = self.norm(extra_final_h)
+                extra_logits = self.output(extra_final_h)
+                self.last_half_loss = loss(extra_logits)
+                self.last_full_loss = self.last_loss
+                self.last_loss = (self.last_full_loss + self.last_half_loss) / 2
+
         else:
             # inference-time mini-optimization: only forward the output on the very last position
             logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
@@ -341,3 +360,43 @@ class Transformer(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+    @torch.inference_mode()
+    def generate_beam(self, idx, max_new_tokens, beam_size=4, verbose=False):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (t,)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        Also note this is a super inefficient version of sampling with no key/value cache.
+        """
+        # if the sequence context is growing too long we must crop it at block_size
+        idx_cond = idx if idx.size(0) <= self.params.max_seq_len else idx[-self.params.max_seq_len:]
+        candidate_seqs = [(idx_cond, 0.0)]
+        for _ in range(max_new_tokens):
+            if verbose:
+                from rand_regex_prior import vocab
+                for s, score in sorted([(c[len(idx_cond):].tolist(), float(p)) for c,p in candidate_seqs], key=lambda x: x[1], reverse=True):
+                    print(f"{score:.2f} ", end='')
+                    for idx in s:
+                        print(vocab[idx], end='')
+                    print()
+                print('--------')
+            new_candidates = []
+            for candidate, log_prob_score in candidate_seqs:
+                # forward the model to get the logits for the index in the sequence
+                logits = self(candidate[None]).squeeze()
+                assert logits.shape == (self.params.vocab_size,)
+                # apply softmax to convert logits to (normalized) probabilities
+                probs = logits.log_softmax(dim=0)
+                # get the top k candidates
+                topk_probs, topk_indices = probs.topk(beam_size)
+                new_candidates.extend(
+                    (torch.cat((candidate, idx[None]),0), log_prob_score + log_prob)
+                    for idx, log_prob in zip(topk_indices, topk_probs)
+                )
+            candidate_seqs = sorted(new_candidates, key=lambda x: x[1], reverse=True)[:beam_size]
+        return candidate_seqs
+
+
+
+

@@ -28,32 +28,33 @@ from model import Transformer, ModelArgs
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from tinystories import Task
+import tinystories, rand_regex_prior
 from export import model_export
 
 # -----------------------------------------------------------------------------
 # I/O
-out_dir = "out"
 eval_interval = 2000
-log_interval = 1
-eval_iters = 100
+log_interval = 100
+eval_iters = 10_000
 eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = False  # if True, always save a checkpoint after each eval
 init_from = "scratch"  # 'scratch' or 'resume'
 # wandb logging
-wandb_log = False  # disabled by default
-wandb_project = "llamac"
+wandb_log = True  # disabled by default
+wandb_project = "code-pred"
 wandb_run_name = "run" + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+out_dir = "out/" + wandb_run_name
 # data
-batch_size = 128  # if gradient_accumulation_steps > 1, this is the micro-batch size
-max_seq_len = 256
-vocab_source = "llama2" # llama2|custom; use Lllama 2 vocab from Meta, or custom trained
-vocab_size = 32000 # the Llama 2 tokenizer has 32K tokens
+batch_size = 32  # if gradient_accumulation_steps > 1, this is the micro-batch size
+max_seq_len = 64
+#vocab_source = "llama2" # llama2|custom; use Lllama 2 vocab from Meta, or custom trained
+vocab_source='custom'
+vocab_size = 307 # 32000 # the Llama 2 tokenizer has 32K tokens
 # model
-dim = 288
-n_layers = 6
-n_heads = 6
-n_kv_heads = 6
+dim = 1024
+n_layers = 8
+n_heads = 16
+n_kv_heads = n_heads
 multiple_of = 32
 dropout = 0.0
 # adamw optimizer
@@ -69,7 +70,10 @@ decay_lr = True  # whether to decay the learning rate
 warmup_iters = 1000  # how many steps to warm up for
 # system
 device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = "bfloat16"  # float32|bfloat16|float16
+dtype = "float16"  # float32|bfloat16|float16
+
+data = 'rand_regex_prior'
+train_half_sized_model_alongside = True
 compile = True  # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [
@@ -77,7 +81,7 @@ config_keys = [
     for k, v in globals().items()
     if not k.startswith("_") and isinstance(v, (int, float, bool, str))
 ]
-exec(open("configurator.py").read())  # overrides from command line or config file
+exec(open("configurator.py", 'r').read())  # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
 
@@ -128,16 +132,31 @@ ctx = (
     else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 )
 
-# task-specific setup
-iter_batches = partial(
-    Task.iter_batches,
-    batch_size=batch_size,
-    max_seq_len=max_seq_len,
-    vocab_size=vocab_size,
-    vocab_source=vocab_source,
-    device=device,
-    num_workers=0,
-)
+if data == 'tinystories':
+    # task-specific setup
+    iter_batches = partial(
+        tinystoriesy.Task.iter_batches,
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        vocab_size=vocab_size,
+        vocab_source=vocab_source,
+        device=device,
+        num_workers=0,
+    )
+    PAD_IDX = -1
+elif data == 'rand_regex_prior':
+    iter_batches = partial(
+        rand_regex_prior.Task.iter_batches,
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        vocab_size=vocab_size,
+        vocab_source=vocab_source,
+        device=device,
+        num_workers=0,
+    )
+    PAD_IDX = rand_regex_prior.PAD_IDX
+else:
+    raise ValueError("specify ok data arg")
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -153,6 +172,8 @@ model_args = dict(
     multiple_of=multiple_of,
     max_seq_len=max_seq_len,
     dropout=dropout,
+    pad_idx=PAD_IDX,
+    train_half_sized_model_alongside=train_half_sized_model_alongside,
 )  # start with model_args from command line
 if init_from == "scratch":
     # init a new model from scratch
@@ -212,7 +233,8 @@ if ddp:
 def estimate_loss():
     out = {}
     model.eval()
-    for split in ["train", "val"]:
+    start_time = time.time()
+    for split in ["train"]:
         batch_iter = iter_batches(split=split)
         losses = torch.zeros(eval_iters)  # keep on CPU
         for k in range(eval_iters):
@@ -222,7 +244,10 @@ def estimate_loss():
                 loss = raw_model.last_loss
             losses[k] = loss.item()
         out[split] = losses.mean()
+    if 'val' not in out:
+        out['val'] = out['train']
     model.train()
+    print('eval took', time.time()-start_time, 'seconds')
     return out
 
 # learning rate decay scheduler (cosine with warmup)
